@@ -1,30 +1,39 @@
-# Transformer Template
-A template for creating transformers for multiple environments.
+# Transformer: PSII sensor files to PNG 
 
-## Quick Start
-To use this template:
-1. Clone this template into a new repository
-2. Fill out the `configuration.py` file with your information. Feel free to add additional variables.
-3. Add your code to the `transformer.py` file, filling in the *add_parameters*, *check_continue*, and *perform_process* functions.
-4. Run the `generate-docker.py` script to generate your Dockerfile for building images
-5. Build the Docker image for your transformer, being sure to specify the desired source image
+Converts PSII sensor files to PNG and TIFF format.
+Also produces a combined histogram image and a combined false color image.  
 
-For your transformer to be accepted, be sure to have test cases and continuous integration setup.
-Please be sure to read about how to contribute in the documents held in our [main repository](https://github.com/AgPipeline/Organization-info).
+### Sample Docker Command Line
 
-## Extending the Template
-There are situations where this template won't be sufficient as a transformer for an environment.
-In these cases it's recommended that instead of forking this repo and making modifications, a new template repo is created with the expectation that the processing code will be a submodule to it.
-Scripts and/or instructions can then be provided on cloning this repo, specifying the submodule, and how to create a working transformer for the environment.
+Below is a sample command line that shows how the PSII to PNG Docker image could be run.
+An explanation of the command line options used follows.
+Be sure to read up on the [docker run](https://docs.docker.com/engine/reference/run/) command line for more information.
 
-The benefit of this approach is that the processing code can be updated in its original repo, and a clear update path is available to create an updated transformer for the environment.
-Another benefit is the clean separation of the processing logic and the environment via seperate repos.
+The files used in this sample command line can be found on [Google Drive](https://drive.google.com/file/d/1hJ5HBbKEPrrK566nTuVjxu2ebHliiO0R/view?usp=sharing).
 
-A drawback is that there may be a proliferation of repos.
+```sh
+docker run --rm --mount "src=/home/test,target=/mnt,type=bind" agpipeline/psii2png:2.0 --working_space /mnt --metadata /mnt/2018-06-19__02-30-22-631/30a2e41a-3af4-4ed2-8948-70bd1327d9b7_metadata_cleaned.json "/mnt/2018-06-19__02-30-22-631"
+```
 
-=======
-2. Fill out the `configuration.py` file with your information
-3. Add your code to the `transformer.py` file
-4. Build the Docker image being sure to specify the desired source image
+This example command line assumes the source files are located in the `/home/test` folder of the local machine.
+The name of the image to run is `agpipeline/psii2png:2.0`.
 
-## 
+We are using the same folder for the source files and the output files.
+By using multiple `--mount` options, the source and output files can be separated.
+
+**Docker commands** \
+Everything between 'docker' and the name of the Docker image are docker commands.
+
+- `run` indicates we want to run an image
+- `--rm` automatically delete the image instance after it's run
+- `--mount "src=/home/test,target=/mnt,type=bind"` mounts the `/home/test` folder to the `/mnt` folder of the running image
+
+We mount the `/home/test` folder to the running image to make files available to the software in the image.
+
+**Image's commands** \
+The command line parameters after the image name are passed to the software inside the image.
+Note that the paths provided are relative to the running image (see the --mount option specified above).
+
+- `--working_space "/mnt"` specifies the folder to use as a workspace
+- `--metadata /mnt/2018-06-19__02-30-22-631/30a2e41a-3af4-4ed2-8948-70bd1327d9b7_metadata_cleaned.json` specifies the metadata to use when processing the data
+- `"/mnt/2018-06-19__02-30-22-631"` is the folder containing the sensor files to process
