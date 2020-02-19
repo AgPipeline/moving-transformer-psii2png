@@ -1,202 +1,230 @@
+"""Transforms PSII camera output to PNG file format"""
+
+import datetime
 import logging
 import os
-import json
 import numpy as np
+from PIL import Image
+from matplotlib import pyplot as plt
 
-from terrautils.spatial import scanalyzer_to_utm, geojson_to_tuples
-from terrautils.formats import create_geotiff
+from terrautils.formats import create_geotiff, create_image
+from terrautils.spatial import geojson_to_tuples
+
 import configuration
-try:
-    import transformer_class
-except ImportError:
-    pass
+import transformer_class
 
 
-class calibParam:
+class __internal__:
+    """Class for internal functions
+    """
     def __init__(self):
-        self.calibrated = True
-        self.calibrationR = 0.0
-        self.calibrationB = 0.0
-        self.calibrationF = 0.0
-        self.calibrationJ1 = 0.0
-        self.calibrationJ0 = 0.0
-        self.calibrationa1 = 0.0
-        self.calibrationa2 = 0.0
-        self.calibrationX = 0.0
-        self.calibrationb1 = 0.0
-        self.calibrationb2 = 0.0
+        """Initializes class instance
+        """
+
+    @staticmethod
+    def get_image_dimensions(metadata: dict) -> tuple:
+        """Returns the image width and height as a tuple
+        Arguments:
+            metadata: the metadata to reference
+        Return:
+            Returns a tuple consisting of the image width and height: (width, height)
+        """
+        if 'sensor_fixed_metadata' in metadata:
+            dims = metadata['sensor_fixed_metadata']['camera_resolution']
+            return dims.split("x")
+
+        # Default based on original fixed metadata
+        return 1936, 1216
+
+    @staticmethod
+    def load_image_file(file_path: str) -> np.ndarray:
+        """Load an image into a numpy array
+        Arguments:
+            file_path: the path of the image to load
+        """
+        image_data = Image.open(file_path)
+        return np.array(image_data).astype('uint8')
+
+    @staticmethod
+    def analyze(frames: dict, hist_path: str, color_img_path: str):
+        """Performs analysis on images
+        Arguments:
+            frames: the files to load
+            hist_path: path to save histogram file
+            color_img_path: path to save false color image
+        """
+        fdark = __internal__.load_image_file(frames[0])
+        fmin = __internal__.load_image_file(frames[1])
+
+        # Calculate the maximum fluorescence for each frame
+        fave = [np.max(fdark)]
+        # Calculate the maximum value for frames 2 through 100. Bin file 101 is an XML file that lists the frame times
+        for i in range(2, 101):
+            img = __internal__.load_image_file(frames[i])
+            fave.append(np.max(img))
+
+        # Assign the first image with the most fluorescence as F-max
+        fmax = __internal__.load_image_file(frames[np.where(fave == np.max(fave))[0][0]])
+        # Calculate F-variable (F-max - F-min)
+        fvar = np.subtract(fmax, fmin)
+        # Calculate Fv/Fm (F-variable / F-max)
+        try:
+            fvfm = np.divide(fvar.astype('float'), fmax.astype('float'))
+        except Exception:
+            logging.debug("Error calculating fvfm, defaulting to zero")
+            fvfm = 0
+        # Fv/Fm will generate invalid values, such as division by zero
+        # Convert invalid values to zero. Valid values will be between 0 and 1
+        fvfm[np.where(np.isnan(fvfm))] = 0
+        fvfm[np.where(np.isinf(fvfm))] = 0
+        fvfm[np.where(fvfm > 1.0)] = 0
+
+        # Plot Fv/Fm (pseudocolored)
+        plt.imshow(fvfm, cmap="viridis")
+        plt.savefig(color_img_path)
+        plt.show()
+        plt.close()
+
+        # Calculate histogram of Fv/Fm values from the whole image
+        hist, bins = np.histogram(fvfm, bins=20)
+        # Plot Fv/Fm histogram
+        width = 0.7 * (bins[1] - bins[0])
+        center = (bins[:-1] + bins[1:]) / 2
+        plt.bar(center, hist, align='center', width=width)
+        plt.xlabel("Fv/Fm")
+        plt.ylabel("Pixels")
+        plt.show()
+        plt.savefig(hist_path)
+        plt.close()
 
 
-def get_calibrate_param(metadata):
-    calibparameter = calibParam()
-
-    try:
-        if 'terraref_cleaned_metadata' in metadata:
-            fixedmd = metadata['sensor_fixed_metadata']
-            if fixedmd['is_calibrated'] == 'True':
-                return calibparameter
-            else:
-                calibparameter.calibrated = False
-                calibparameter.calibrationR = float(fixedmd['calibration_R'])
-                calibparameter.calibrationB = float(fixedmd['calibration_B'])
-                calibparameter.calibrationF = float(fixedmd['calibration_F'])
-                calibparameter.calibrationJ1 = float(fixedmd['calibration_J1'])
-                calibparameter.calibrationJ0 = float(fixedmd['calibration_J0'])
-                calibparameter.calibrationa1 = float(fixedmd['calibration_alpha1'])
-                calibparameter.calibrationa2 = float(fixedmd['calibration_alpha2'])
-                calibparameter.calibrationX = float(fixedmd['calibration_X'])
-                calibparameter.calibrationb1 = float(fixedmd['calibration_beta1'])
-                calibparameter.calibrationb2 = float(fixedmd['calibration_beta2'])
-                return calibparameter
-
-    except KeyError as err:
-        return calibparameter
-
-
-# convert flir raw data into temperature C degree, for date after September 15th
-def flirRawToTemperature(rawData, calibP):
-
-    R = calibP.calibrationR
-    B = calibP.calibrationB
-    F = calibP.calibrationF
-    J0 = calibP.calibrationJ0
-    J1 = calibP.calibrationJ1
-
-    X = calibP.calibrationX
-    a1 = calibP.calibrationa1
-    b1 = calibP.calibrationb1
-    a2 = calibP.calibrationa2
-    b2 = calibP.calibrationb2
-
-    H2O_K1 = 1.56
-    H2O_K2 = 0.0694
-    H2O_K3 = -0.000278
-    H2O_K4 = 0.000000685
-
-    H = 0.1
-    T = 22.0
-    D = 2.5
-    E = 0.98
-
-    K0 = 273.15
-
-    im = rawData
-
-    AmbTemp = T + K0
-    AtmTemp = T + K0
-
-    H2OInGperM2 = H*math.exp(H2O_K1 + H2O_K2*T + H2O_K3*math.pow(T, 2) + H2O_K4*math.pow(T, 3))
-    a1b1sqH2O = (a1+b1*math.sqrt(H2OInGperM2))
-    a2b2sqH2O = (a2+b2*math.sqrt(H2OInGperM2))
-    exp1 = math.exp(-math.sqrt(D/2)*a1b1sqH2O)
-    exp2 = math.exp(-math.sqrt(D/2)*a2b2sqH2O)
-
-    tao = X*exp1 + (1-X)*exp2
-
-    obj_rad = im*E*tao
-
-    theo_atm_rad = (R*J1/(math.exp(B/AtmTemp)-F)) + J0
-    atm_rad = repmat((1-tao)*theo_atm_rad, 640, 480)
-
-    theo_amb_refl_rad = (R*J1/(math.exp(B/AmbTemp)-F)) + J0
-    amb_refl_rad = repmat((1-E)*tao*theo_amb_refl_rad, 640, 480)
-
-    corr_pxl_val = obj_rad + atm_rad + amb_refl_rad
-
-    pxl_temp = B/np.log(R/(corr_pxl_val-J0)*J1+F)
-
-    return pxl_temp
-
-
-def rawData_to_temperature(rawData, metadata):
-    try:
-        calibP = get_calibrate_param(metadata)
-        tc = np.zeros((640, 480))
-
-        if calibP.calibrated:
-            tc = rawData/10
-        else:
-            tc = flirRawToTemperature(rawData, calibP)
-
-        return tc
-    except Exception as ex:
-        fail('raw to temperature fail:' + str(ex))
-
-
-def flir2tif(input_paths, full_md = None):
-    # Determine metadata and BIN file
-    bin_file = None
-    for f in input_paths:
-        if f.endswith(".bin"):
-            bin_file = f
-        if f.endswith("_cleaned.json") and full_md is None:
-            with open(f, 'r') as mdf:
-                full_md = json.load(mdf)['content']
-
-    # TODO: Figure out how to pass extractor details to create_geotiff in both types of pipelines
-    extractor_info = None
-
-    if full_md:
-        if bin_file is not None:
-            out_file = bin_file.replace(".bin", ".tif")
-            gps_bounds_bin = geojson_to_tuples(full_md['spatial_metadata']['flirIrCamera']['bounding_box'])
-            raw_data = np.fromfile(bin_file, np.dtype('<u2')).reshape([480, 640]).astype('float')
-            raw_data = np.rot90(raw_data, 3)
-            tc = rawData_to_temperature(raw_data, full_md)
-            create_geotiff(tc, gps_bounds_bin, out_file, None, False, extractor_info, full_md, compress=True)
-
-    # Return formatted dict for simple extractor
-    return {
-        "metadata": {
-            "files_created": [out_file]
-        },
-        "outputs": [out_file]
-    }
-
-
-def check_continue(transformer, check_md: dict, transformer_md: dict, full_md: dict, **kwargs) -> dict:
+def check_continue(transformer: transformer_class.Transformer, check_md: dict, transformer_md: list, full_md: list) -> tuple:
     """Checks if conditions are right for continuing processing
     Arguments:
         transformer: instance of transformer class
+        check_md: request specific metadata
+        transformer_md: metadata associated with previous runs of the transformer
+        full_md: the full set of metadata available to the transformer
     Return:
-        Returns a dictionary containining the return code for continuing or not, and
+        Returns a tuple containing the return code for continuing or not, and
         an error message if there's an error
     """
-    print("check_continue(): received arguments: %s" % str(kwargs))
-    return (0)
+    # pylint: disable=unused-argument
+    # Make sure we have all the files we need
+    file_list = check_md['list_files']()
+
+    # Generate a list of image file names to check
+    file_endings = ["{0:0>4}.bin".format(i) for i in range(0, 102)]
+
+    # Build a list of file endings to match
+    source_endings = []
+    for one_file in file_list:
+        source_endings.append(one_file[-8:])
+
+    # Check if the intersection is an empty set
+    any_missing = set(file_endings).intersection(set(source_endings))
+
+    if any_missing:
+        return -1, "Not all the necessary sensor files were found"
+
+    return tuple([0])
 
 
-def perform_process(transformer, check_md: dict, transformer_md: dict, full_md: dict) -> dict:
+def perform_process(transformer: transformer_class.Transformer, check_md: dict, transformer_md: list, full_md: list) -> dict:
     """Performs the processing of the data
     Arguments:
         transformer: instance of transformer class
     Return:
         Returns a dictionary with the results of processing
     """
+    # pylint: disable=unused-argument
     result = {}
     file_md = []
+    start_timestamp = datetime.datetime.utcnow()
 
-    file_list = os.listdir(check_md['working_folder'])
+    file_list = check_md['list_files']()
+    files_count = len(file_list)
 
+    # Find the metadata we're interested in for calibration parameters
+    terra_md = None
+    for one_md in full_md:
+        if 'terraref_cleaned_metadata' in one_md:
+            terra_md = one_md
+            break
+    if not terra_md:
+        raise RuntimeError("Unable to find TERRA REF specific metadata")
+
+    transformer_md = transformer.generate_transformer_md()
+
+    # Generate a list of approved file name endings
+    file_endings = ["{0:0>4}.bin".format(i) for i in range(0, 102)]
+
+    files_processed = 0
     try:
-        bin_files = []
+        img_width, img_height = __internal__.get_image_dimensions(terra_md)
+        gps_bounds = geojson_to_tuples(terra_md['spatial_metadata']['ps2Top']['bounding_box'])
+
+        png_frames = {}
         for one_file in file_list:
-            if one_file.endswith(".bin"):
-                bin_files.append(os.path.join(check_md['working_folder'], one_file))
-        if len(bin_files) > 0:
-            output = flir2tif(bin_files, full_md)
-            file_md.append({
-                'path': output['output'],
-                'key': configuration.TRANSFORMER_SENSOR,
-                'metadata': {
-                    'data': transformer_md
-                }
-            })
+            if one_file[-8:] in file_endings:
+                files_processed += 1
+
+                raw_data = np.fromfile(one_file, np.dtype('<u2')).reshape([img_width, img_height]).astype('float')
+
+                png_filename = os.path.join(check_md['working_folder'], os.path.basename(one_file.replace('.bin', '.png')))
+                logging.info("Creating: '%s'", png_filename)
+                create_image(raw_data, png_filename, transformer.args.scale_values)
+                cur_md = {'path': png_filename,
+                          'key': configuration.TRANSFORMER_SENSOR,
+                          'metadata': {
+                              'data': {
+                                  'data': transformer_md
+                              }
+                          }}
+                file_md.append(cur_md)
+                png_frames[int(one_file[-8:-4])] = png_filename
+
+                tif_filename = os.path.join(check_md['working_folder'], os.path.basename(one_file.replace('.bin', '.tif')))
+                logging.info("Creating: '%s'", tif_filename)
+                create_geotiff(raw_data, gps_bounds, tif_filename, None, False, transformer_md, terra_md)
+                cur_md = {'path': tif_filename,
+                          'key': configuration.TRANSFORMER_SENSOR,
+                          'metadata': {
+                              'data': transformer_md
+                          }}
+                file_md.append(cur_md)
+
+        logging.info("Generating aggregates")
+        hist_path = os.path.join(check_md['working_folder'], 'combined_hist.png')
+        false_color_path = os.path.join(check_md['working_folder'], 'combined_pseudocolored.png')
+        __internal__.analyze(png_frames, hist_path, false_color_path)
+        cur_md = {'path': hist_path,
+                  'key': configuration.TRANSFORMER_SENSOR,
+                  'metadata': {
+                      'data': transformer_md
+                  }}
+        file_md.append(cur_md)
+        cur_md = {'path': false_color_path,
+                  'key': configuration.TRANSFORMER_SENSOR,
+                  'metadata': {
+                      'data': transformer_md
+                  }}
+        file_md.append(cur_md)
+
         result['code'] = 0
         result['file'] = file_md
+        result[configuration.TRANSFORMER_NAME] = {
+            'version': configuration.TRANSFORMER_VERSION,
+            'utc_timestamp': datetime.datetime.utcnow().isoformat(),
+            'processing_time': str(datetime.datetime.now() - start_timestamp),
+            'num_files_received': str(files_count),
+            'files_processed': str(files_processed)
+        }
 
     except Exception as ex:
+        msg = 'Exception caught converting PSII files'
+        logging.exception(msg)
         result['code'] = -1
-        result['error'] = "Exception caught converting PLY files: %s" % str(ex)
+        result['error'] = msg + ': ' + str(ex)
 
     return result
