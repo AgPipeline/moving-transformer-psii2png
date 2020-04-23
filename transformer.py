@@ -224,6 +224,7 @@ def perform_process(transformer: transformer_class.Transformer, check_md: dict, 
 
                 try:
                     pixels = np.fromfile(one_file, np.dtype('uint8')).reshape([int(img_height), int(img_width)])
+                    pixels = np.rot90(pixels, 3)
                 except ValueError:
                     logging.info("Ignoring ValueError exception while loading file '%s'", one_file)
                     continue
